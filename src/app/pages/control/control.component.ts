@@ -1,6 +1,6 @@
 // src/app/pages/control/control.component.ts
 import { Component, AfterViewInit, OnDestroy, ElementRef } from '@angular/core';
-import { ApiService, EquipoMini } from '../../core/api.service';
+import { ApiService, EquipoMini, RosterItemPost } from '../../core/api.service';
 import { Subscription, firstValueFrom } from 'rxjs';
 
 @Component({
@@ -26,13 +26,15 @@ import { Subscription, firstValueFrom } from 'rxjs';
 
     <div class="field">
       <span>JUGADORES</span>
+      <span class="pill-mini" id="cntLocal" style="margin-left:8px">0/5</span>
       <div class="roster" id="rosterLocal"></div>
     </div>
 
     <div class="row">
-      <button class="btn primary">Aplicar</button>
-      <button class="btn subtle">Reiniciar</button>
+      <button class="btn primary" id="btnApplyLocal">Aplicar</button>
+      <button class="btn subtle" id="btnResetLocal">Reiniciar</button>
     </div>
+    <div id="msgLocal" style="margin-top:8px;font-size:12px;color:#888;min-height:16px;"></div>
   </div>
 
   <span class="shelf"></span>
@@ -56,13 +58,15 @@ import { Subscription, firstValueFrom } from 'rxjs';
 
     <div class="field">
       <span>JUGADORES</span>
+      <span class="pill-mini" id="cntVisit" style="margin-left:8px">0/5</span>
       <div class="roster" id="rosterVisitante"></div>
     </div>
 
     <div class="row">
-      <button class="btn primary">Aplicar</button>
-      <button class="btn subtle">Reiniciar</button>
+      <button class="btn primary" id="btnApplyVisit">Aplicar</button>
+      <button class="btn subtle" id="btnResetVisit">Reiniciar</button>
     </div>
+    <div id="msgVisit" style="margin-top:8px;font-size:12px;color:#888;min-height:16px;"></div>
   </div>
 
   <span class="shelf"></span>
@@ -227,7 +231,6 @@ import { Subscription, firstValueFrom } from 'rxjs';
     <!-- Toast/Mensaje temporal -->
     <div id="toastMsg" role="status" aria-live="polite"
          style="position:absolute;right:16px;bottom:16px;display:none;padding:10px 14px;border-radius:10px;background:var(--bgElevated,#111);color:var(--fg,#fff);box-shadow:0 6px 20px rgba(0,0,0,.25);">
-      <!-- contenido dinámico -->
     </div>
 
     <!-- Confirmación Guardar -->
@@ -255,9 +258,49 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
   private equipos: any[] = [];
   private rosterCache: { local: any[]; visitante: any[] } = { local: [], visitante: [] };
 
+  // selección de titulares (máx. 5) por equipo
+  private starters = {
+    local: new Set<number>(),
+    visitante: new Set<number>()
+  };
+
   constructor(private api: ApiService, private el: ElementRef<HTMLElement>) {
     this.api.connectHub();
   }
+
+  /* ==================== PERSISTENCIA LOCAL (F5) ==================== */
+  // clave en localStorage: starters:<side>:<equipoId>
+  private storageKey(side: 'local'|'visitante', equipoId: number | null) {
+    return `starters:${side}:${equipoId ?? 0}`;
+  }
+  private getTeamId(side: 'local'|'visitante'): number | null {
+    const t = this.api.teams$.value;
+    return side === 'local' ? (t.local?.id ?? null) : (t.visitante?.id ?? null);
+  }
+  private restoreFromStorage(side: 'local'|'visitante', equipoId: number | null) {
+    try {
+      const raw = localStorage.getItem(this.storageKey(side, equipoId));
+      const arr: number[] = raw ? JSON.parse(raw) : [];
+      this.starters[side].clear();
+      arr.forEach(n => this.starters[side].add(Number(n)));
+    } catch {
+      this.starters[side].clear();
+    }
+  }
+  private persistToStorage(side: 'local'|'visitante') {
+    const equipoId = this.getTeamId(side);
+    if (!equipoId) return; // sin equipo no persistimos
+    try {
+      localStorage.setItem(
+        this.storageKey(side, equipoId),
+        JSON.stringify(Array.from(this.starters[side]))
+      );
+    } catch {}
+  }
+  private clearStorageFor(side: 'local'|'visitante', equipoId: number | null) {
+    try { localStorage.removeItem(this.storageKey(side, equipoId)); } catch {}
+  }
+  /* ================================================================ */
 
   ngAfterViewInit(): void {
     const host = this.el.nativeElement;
@@ -273,11 +316,18 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
     const rostLocal = left ?.querySelector('#rosterLocal')      as HTMLElement | null;
     const rostVisit = right?.querySelector('#rosterVisitante')  as HTMLElement | null;
 
+    const cntLocal  = left ?.querySelector('#cntLocal')  as HTMLElement | null;
+    const cntVisit  = right?.querySelector('#cntVisit')  as HTMLElement | null;
+
+    // mensajes
+    const msgLocal  = left ?.querySelector('#msgLocal')  as HTMLElement | null;
+    const msgVisit  = right?.querySelector('#msgVisit')  as HTMLElement | null;
+
     /* FALTAS section */
     const secFaltas = Array.from(host.querySelectorAll('.section'))
       .find(s => s.querySelector('h4')?.textContent?.trim().toLowerCase() === 'faltas') as HTMLElement | undefined;
     const rowFLocal = secFaltas?.querySelectorAll('.row')[0] as HTMLElement | undefined;
-   const rowFVisit = secFaltas?.querySelectorAll('.row')[1] as HTMLElement | undefined;
+    const rowFVisit = secFaltas?.querySelectorAll('.row')[1] as HTMLElement | undefined;
 
     const selFaltaLocal = rowFLocal?.querySelector('select[aria-label="Jugador local"]') as HTMLSelectElement | null;
     const selFaltaVisit = rowFVisit?.querySelector('select[aria-label="Jugador visitante"]') as HTMLSelectElement | null;
@@ -321,22 +371,109 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       });
     };
 
-    const renderRoster = (el: HTMLElement | null, jugadores: any[]) => {
+    // mensajes
+    const showMessage = (side: 'local'|'visitante', text: string, isError = false) => {
+      const msgEl = side === 'local' ? msgLocal : msgVisit;
+      if (!msgEl) return;
+      msgEl.textContent = text;
+      msgEl.style.color = isError ? '#ff6b6b' : '#888';
+      if (!isError && text) {
+        setTimeout(() => {
+          if (msgEl.textContent === text) msgEl.textContent = '';
+        }, 3000);
+      }
+    };
+
+    // validar si se pueden hacer cambios
+    const canMakeChanges = (side: 'local'|'visitante'): boolean => {
+      const timerPhase = this.api.timer$.value.phase;
+      const hasPartido = !!this.api.partidoId$.value;
+      if (!hasPartido) return true;
+      if (timerPhase === 'paused') return true;
+      showMessage(side, '⏸ Pausa el partido para hacer cambios', true);
+      return false;
+    };
+
+    // ===== NUEVO: persistir titulares actuales al backend (no cambia F5, pero se mantiene) =====
+    const saveCurrentStartersToRoster = async () => {
+      const pid = this.api.partidoId$.value ?? null;
+      if (!pid) return;
+      const t = this.api.teams$.value;
+      const localId = t.local?.id ?? 0;
+      const visitId = t.visitante?.id ?? 0;
+      if (!localId || !visitId) return;
+
+      const toItems = (set: Set<number>, equipoId: number): RosterItemPost[] =>
+        Array.from(set).map(jid => ({ partidoId: pid, equipoId, jugadorId: jid, esTitular: true }));
+
+      const items: RosterItemPost[] = [
+        ...toItems(this.starters.local, localId),
+        ...toItems(this.starters.visitante, visitId),
+      ];
+
+      try { await this.api.saveRosterAdmin(pid, items); } catch {}
+    };
+
+    // render con checkbox (máx. 5)
+    const renderRoster = (el: HTMLElement | null, jugadores: any[], side: 'local'|'visitante') => {
       if (!el) return;
-      if (!jugadores || jugadores.length === 0) { el.innerHTML = ''; return; }
+      if (!jugadores || jugadores.length === 0) { el.innerHTML = ''; updateCounter(side); return; }
+
+      const selected = this.starters[side];
       el.innerHTML = jugadores.map(j => {
         const dorsal = (j.dorsal ?? j.numero ?? j.num ?? null);
-        const pos = j.posicion ?? j.pos ?? null;
         const nombre = [j.nombres, j.apellidos].filter(Boolean).join(' ');
+        const checked = selected.has(Number(j.id ?? j.jugador_id)) ? 'checked' : '';
+        const disabled = !canMakeChanges(side) ? 'disabled' : '';
         return `
-          <div class="roster-item" style="display:flex;align-items:center;gap:8px;margin:4px 0;">
+          <label class="roster-item" style="display:flex;align-items:center;gap:8px;margin:4px 0;">
+            <input type="checkbox" class="ck-starter" data-jid="${j.jugador_id ?? j.id}" ${checked} ${disabled} />
             <span class="tag" style="display:inline-block;min-width:32px;text-align:center;border:1px solid var(--border);border-radius:6px;padding:2px 6px;">
               ${dorsal ?? '—'}
             </span>
-            <span class="name">${nombre}${pos ? ` <small>(${pos})</small>` : ''}</span>
-          </div>
+            <span class="name">${nombre}</span>
+          </label>
         `;
       }).join('');
+
+      // Cambios con tope 5 + persistir (localStorage + opcional backend en pausa)
+      el.querySelectorAll<HTMLInputElement>('input.ck-starter').forEach(ck => {
+        ck.addEventListener('change', async () => {
+          if (ck.disabled) return;
+          const selected = this.starters[side];
+          const jid = Number(ck.dataset['jid']);
+          if (ck.checked) {
+            if (selected.size >= 5 && !selected.has(jid)) {
+              ck.checked = false;
+              showMessage(side, 'Máximo 5 titulares permitidos', true);
+              return;
+            }
+            selected.add(jid);
+            showMessage(side, `Titular agregado: ${selected.size}/5`);
+          } else {
+            selected.delete(jid);
+            showMessage(side, `Titular removido: ${selected.size}/5`);
+          }
+          updateCounter(side);
+
+          // ======= PERSISTENCIA F5 =======
+          this.persistToStorage(side);
+          // ================================
+
+          // Persistir al vuelo cuando está pausado (BD)
+          if (this.api.partidoId$.value && this.api.timer$.value.phase === 'paused') {
+            await saveCurrentStartersToRoster();
+          }
+        });
+      });
+
+      updateCounter(side);
+    };
+
+    const updateCounter = (side: 'local'|'visitante') => {
+      const n = this.starters[side].size;
+      if (side === 'local' && cntLocal) cntLocal.textContent = `${n}/5`;
+      if (side === 'visitante' && cntVisit) cntVisit.textContent = `${n}/5`;
     };
 
     const fillFoulSelect = (target: HTMLSelectElement | null, jugadores: any[]) => {
@@ -371,6 +508,12 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       const rosterEl = (side === 'local') ? rostLocal : rostVisit;
       const targetSel = (side === 'local') ? selFaltaLocal : selFaltaVisit;
 
+      // ======= RESTAURAR SELECCIÓN DESDE localStorage (F5) =======
+      this.restoreFromStorage(side, equipoId);
+      // ===========================================================
+
+      updateCounter(side);
+
       if (!equipoId || equipoId <= 0) {
         if (rosterEl) rosterEl.innerHTML = '';
         fillFoulSelect(targetSel, []);
@@ -382,13 +525,13 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       this.api.getJugadores(equipoId).subscribe({
         next: (rows) => {
           const jugadores = Array.isArray(rows) ? rows : [];
-          renderRoster(rosterEl, jugadores);
+          renderRoster(rosterEl, jugadores, side);
           fillFoulSelect(targetSel, jugadores);
           if (side === 'local') this.rosterCache.local = jugadores;
           else this.rosterCache.visitante = jugadores;
         },
         error: () => {
-          renderRoster(rosterEl, []);
+          renderRoster(rosterEl, [], side);
           fillFoulSelect(targetSel, []);
           if (side === 'local') this.rosterCache.local = [];
           else this.rosterCache.visitante = [];
@@ -397,11 +540,24 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
     };
 
     /* Aplicar selección manual */
-    const applySide = (side: 'local'|'visitante', team: EquipoMini | null, badge: HTMLElement | null) => {
+    const applySide = async (side: 'local'|'visitante', team: EquipoMini | null, badge: HTMLElement | null) => {
+      if (!canMakeChanges(side)) {
+        showMessage(side, '⏸ Pausa el partido para aplicar cambios', true);
+        return;
+      }
+
+      // Si cambio de equipo, no borro la selección guardada: quedará por equipo
       if (badge) badge.textContent = team ? team.nombre : blankBadge;
-      this.api.setTeam(side, team);
+      await this.api.setTeam(side, team);
       const equipoId = team?.id ?? null;
+
+      // Restaurar la selección del equipo elegido (si existe en localStorage) y renderizar
       loadSideRoster(side, equipoId);
+
+      showMessage(side, team ? `Equipo ${side} aplicado: ${team.nombre}` : `Equipo ${side} removido`);
+
+      // Persistir inmediatamente la selección del equipo activo
+      this.persistToStorage(side);
     };
 
     /* Wire botones laterales */
@@ -412,20 +568,28 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       badge: HTMLElement | null
     ) => {
       if (!sideCard) return;
-      const btns = sideCard.querySelectorAll('.row button');
-      const btnApply = btns[0] as HTMLButtonElement | undefined;
-      const btnReset = btns[1] as HTMLButtonElement | undefined;
+      const btnApply = sideCard.querySelector('#btnApply' + (side === 'local' ? 'Local' : 'Visit')) as HTMLButtonElement | null;
+      const btnReset = sideCard.querySelector('#btnReset' + (side === 'local' ? 'Local' : 'Visit')) as HTMLButtonElement | null;
 
-      btnApply?.addEventListener('click', () => {
+      btnApply?.addEventListener('click', async () => {
         const team = selTeam?.value ? findEquipoMini(selTeam.value) : null;
-        applySide(side, team, badge);
+        await applySide(side, team, badge);
       });
 
       btnReset?.addEventListener('click', async () => {
+        if (!canMakeChanges(side)) {
+          showMessage(side, '⏸ Pausa el partido para reiniciar', true);
+          return;
+        }
+        // limpiar UI y (opcional) dejar en storage lo último por equipo
+        const equipoId = this.getTeamId(side);
         if (selTeam) selTeam.selectedIndex = 0;
         if (badge) badge.textContent = blankBadge;
         await this.api.setTeam(side, null);
         loadSideRoster(side, null);
+        showMessage(side, `Equipo ${side} reiniciado`);
+        // si deseas borrar la selección persistida del equipo anterior, descomenta:
+        // this.clearStorageFor(side, equipoId ?? null);
       });
     };
 
@@ -442,18 +606,15 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
 
     const syncUIFromState = () => {
       const t = this.api.teams$.value;
+      if (badLocal)  badLocal.textContent  = t.local ? t.local.nombre : blankBadge;
+      if (badVisit)  badVisit.textContent  = t.visitante ? t.visitante.nombre : blankBadge;
 
-      // badges
-      if (badLocal) badLocal.textContent = t.local ? t.local.nombre : blankBadge;
-      if (badVisit) badVisit.textContent = t.visitante ? t.visitante.nombre : blankBadge;
-
-      // selects (solo si ya tenemos lista de equipos)
       if (this.equipos.length > 0) {
         setSelectValueIfExists(selLocal,  t.local     ? String(t.local.id)     : null);
         setSelectValueIfExists(selVisit,  t.visitante ? String(t.visitante.id) : null);
       }
 
-      // rosters + selects de faltas
+      // Al hidratar, restauramos selección por equipo desde localStorage ANTES de pintar
       loadSideRoster('local',     t.local?.id     ?? null);
       loadSideRoster('visitante', t.visitante?.id ?? null);
     };
@@ -472,6 +633,32 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
     // 2) Resincronizar si cambia teams$
     const teamsSub = this.api.teams$.subscribe(() => { syncUIFromState(); });
     this.subs.push(teamsSub);
+
+    // Cambios del timer → habilitar/deshabilitar checks
+    const updateRosterStates = () => {
+      const canChangeLocal = canMakeChanges('local');
+      const canChangeVisit = canMakeChanges('visitante');
+
+      if (rostLocal) {
+        rostLocal.querySelectorAll<HTMLInputElement>('input.ck-starter').forEach(ck => { ck.disabled = !canChangeLocal; });
+      }
+      if (rostVisit) {
+        rostVisit.querySelectorAll<HTMLInputElement>('input.ck-starter').forEach(ck => { ck.disabled = !canChangeVisit; });
+      }
+
+      if (this.api.partidoId$.value) {
+        const timerPhase = this.api.timer$.value.phase;
+        if (timerPhase === 'running') {
+          if (msgLocal && !msgLocal.textContent?.includes('Pausa'))  showMessage('local', '⏸ Partido en juego - pausa para hacer cambios', true);
+          if (msgVisit && !msgVisit.textContent?.includes('Pausa'))  showMessage('visitante', '⏸ Partido en juego - pausa para hacer cambios', true);
+        } else if (timerPhase === 'paused') {
+          if (msgLocal && msgLocal.textContent?.includes('Pausa'))  showMessage('local', '✅ Partido pausado - puedes hacer cambios');
+          if (msgVisit && msgVisit.textContent?.includes('Pausa'))  showMessage('visitante', '✅ Partido pausado - puedes hacer cambios');
+        }
+      }
+    };
+    const timerSub = this.api.timer$.subscribe(() => { updateRosterStates(); });
+    this.subs.push(timerSub);
 
     /* PUNTOS -> via API */
     const secPuntos = Array.from(host.querySelectorAll('.section'))
@@ -532,6 +719,36 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       catch (e: any) { alert(e?.message ?? 'No se pudo crear el partido.'); return null; }
     };
 
+    // Guardar titulares (exactamente 5 y 5) al iniciar
+    const saveStarters = async (partidoId: number) => {
+      const t = this.api.teams$.value;
+      const localId = t.local?.id ?? 0;
+      const visitId = t.visitante?.id ?? 0;
+
+      const nL = this.starters.local.size;
+      const nV = this.starters.visitante.size;
+
+      if (nL !== 5 || nV !== 5) {
+        alert('Debes seleccionar exactamente 5 titulares por equipo.');
+        throw new Error('Titulares incompletos');
+      }
+
+      const toItems = (side:'local'|'visitante', equipoId:number): RosterItemPost[] =>
+        Array.from(this.starters[side]).map(jid => ({
+          partidoId,
+          equipoId,
+          jugadorId: jid,
+          esTitular: true
+        }));
+
+      const items = [
+        ...toItems('local', localId),
+        ...toItems('visitante', visitId),
+      ];
+
+      await this.api.saveRosterAdmin(partidoId, items);
+    };
+
     if (secTiempo) {
       const bind = (action: string, handler: () => void | Promise<void>) => {
         const btn = secTiempo.querySelector(`button[data-action="${action}"]`) as HTMLButtonElement | null;
@@ -542,16 +759,22 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       const pauseBtn  = secTiempo.querySelector('button[data-action="pause"]')  as HTMLButtonElement | null;
       const finishBtn = secTiempo.querySelector('button[data-action="finish"]') as HTMLButtonElement | null;
 
-      // ▶ Iniciar: ahora se deshabilita en cuanto corre (y también si está pausado)
+      // ▶ Iniciar
       bind('start', async () => {
         const phaseNow = this.api.timer$.value.phase;
-        if (phaseNow === 'running' || phaseNow === 'paused') return; // seguridad
+        if (phaseNow === 'running' || phaseNow === 'paused') return;
+
+        if (this.starters.local.size !== 5 || this.starters.visitante.size !== 5) {
+          alert('Selecciona exactamente 5 titulares en Local y 5 en Visitante.');
+          return;
+        }
 
         const pid = await ensurePartido(); if (!pid) return;
 
+        try { await saveStarters(pid); } catch { return; }
+
         const p = this.api.period$.value;
 
-        // Descanso / Medio tiempo
         if (p.rotulo === 'Descanso') {
           await this.api.timerReset(120, false);
           await this.api.timerStart();
@@ -565,14 +788,12 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
           return;
         }
 
-        // Prórroga
         if (p.esProrroga) {
           await this.api.timerStart();
           if (startBtn) { startBtn.disabled = true; startBtn.title = 'El cronómetro ya está corriendo'; }
           return;
         }
 
-        // Caso normal (cuarto)
         try {
           const dto = await firstValueFrom(this.api.cuartosIniciar(pid));
           const dur = this.api.quarterDurationSec(dto);
@@ -591,7 +812,6 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
         if (!pauseBtn || !startBtn) return;
         const ph = this.api.timer$.value.phase;
 
-        // Texto/estilo del botón de pausa
         if (ph === 'paused') {
           pauseBtn.textContent = '⏵ Reanudar';
           pauseBtn.classList.remove('subtle');
@@ -604,16 +824,12 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
           pauseBtn.title = 'Pausar cronómetro';
         }
 
-        // ▶ Iniciar: estado
         if (ph === 'running') {
-          startBtn.disabled = true;
-          startBtn.title = 'El cronómetro ya está corriendo';
+          startBtn.disabled = true;  startBtn.title = 'El cronómetro ya está corriendo';
         } else if (ph === 'paused') {
-          startBtn.disabled = true;
-          startBtn.title = 'Usa ⏵ Reanudar para continuar';
+          startBtn.disabled = true;  startBtn.title = 'Usa ⏵ Reanudar para continuar';
         } else {
-          startBtn.disabled = false;
-          startBtn.title = '';
+          startBtn.disabled = false; startBtn.title = '';
         }
       };
       renderPauseBtn();
@@ -623,13 +839,13 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       pauseBtn?.addEventListener('click', async () => {
         const ph = this.api.timer$.value.phase;
         if (ph === 'running')      await this.api.timerPause();
-        else if (ph === 'paused')  await this.api.timerStart(); // reanuda SIN resetear
+        else if (ph === 'paused')  await this.api.timerStart();
       });
 
       // ⟲ Reiniciar (solo reloj)
       bind('reset', () => this.api.timerReset(undefined, true));
 
-      // 🔒 Habilitación de ⏹ Finalizar
+      // Habilitación de ⏹ Finalizar
       const renderFinishBtn = () => {
         if (!finishBtn) return;
         const ph = this.api.timer$.value.phase;
@@ -648,15 +864,17 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       this.subs.push(this.api.timer$.subscribe(() => renderFinishBtn()));
       this.subs.push(this.api.period$.subscribe(() => renderFinishBtn()));
 
-      // ⏹ Finalizar
+      // ⏹ Finalizar — guardar últimos titulares antes de cerrar tramo
       bind('finish', async () => {
         if (finishBtn && finishBtn.disabled) return;
+
+        // guardar estado de titulares actual (BD)
+        await saveCurrentStartersToRoster();
 
         const pid = this.api.partidoId$.value ?? null; if (!pid) return;
 
         const p = this.api.period$.value;
 
-        // Fin de Descanso / Medio tiempo -> abrir siguiente cuarto y dejar listo (detenido)
         if (p.rotulo === 'Descanso' || p.rotulo === 'Medio tiempo') {
           try {
             const dto = await firstValueFrom(this.api.cuartosIniciar(pid));
@@ -668,7 +886,6 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
           return;
         }
 
-        // Fin de cuarto / prórroga
         try {
           await firstValueFrom(this.api.cuartosFinalizar(pid));
           await this.api.timerFinish();
@@ -680,7 +897,7 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       // 🔔 Probar sonido
       bind('test',  () => this.api.playTest());
 
-      // ===== Descansos manuales =====
+      // Descansos manuales
       bind('rest-2',      () => this.api.markDescanso());
       bind('halftime-15', () => this.api.markMedio());
     }
@@ -723,7 +940,7 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       const btnNext = secCuartos.querySelector('button[data-action="next-period"]') as HTMLButtonElement | null;
       const btnOT   = secCuartos.querySelector('button[data-action="overtime"]')     as HTMLButtonElement | null;
 
-      // === Controlar habilitación de PRÓRROGA ===
+      // Controlar habilitación de PRÓRROGA
       const updateOvertimeButton = () => {
         const p = this.api.period$.value;
         if (btnOT) {
@@ -740,7 +957,7 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       const otSub = this.api.period$.subscribe(() => updateOvertimeButton());
       this.subs.push(otSub);
 
-      // === Prórroga: abrir en BD solo si ya habilitado ===
+      // Prórroga: abrir en BD solo si habilitado
       btnOT?.addEventListener('click', () => {
         if (btnOT?.disabled) {
           alert("Aún no se han consumido los 4 tiempos.");
@@ -760,12 +977,12 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       const pSub = this.api.period$.subscribe(renderCuarto);
       this.subs.push(pSub);
 
-      // 🚫 Bloquear retroceso
+      // Bloquear retroceso
       btnPrev?.addEventListener('click', () => {
         alert('No se puede retroceder al cuarto anterior.');
       });
 
-      // Siguiente: guiar al flujo correcto
+      // Siguiente: guía
       btnNext?.addEventListener('click', () => {
         alert('Usa ⏹ Finalizar para cerrar y ▶ Iniciar para continuar.');
       });
@@ -774,11 +991,26 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
     /* ==== BOTÓN RESET PARTIDO ==== */
     const btnResetMatch = host.querySelector('#btnResetMatch') as HTMLButtonElement | null;
     btnResetMatch?.addEventListener('click', async () => {
+      const t = this.api.teams$.value;
+      const localId = t.local?.id ?? null;
+      const visitId = t.visitante?.id ?? null;
+
       const pid = this.api.partidoId$.value ?? null;
       await this.api.resetMatch(pid);
 
-      // Limpiar UI local (selects y rosters de laterales / faltas)
+      // Limpiar UI local
+      this.starters.local.clear();
+      this.starters.visitante.clear();
+      if (cntLocal) cntLocal.textContent = '0/5';
+      if (cntVisit) cntVisit.textContent = '0/5';
       this.clearSideUI(host);
+
+      // Borrar persistencia de los equipos activos
+      this.clearStorageFor('local', localId);
+      this.clearStorageFor('visitante', visitId);
+
+      if (msgLocal) msgLocal.textContent = '';
+      if (msgVisit) msgVisit.textContent = '';
     });
 
     /* ==== BOTÓN GUARDAR (con confirmación + toast 5s) ==== */
@@ -799,12 +1031,8 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
 
     btnSaveMatch?.addEventListener('click', () => showModal());
     btnNoSave?.addEventListener('click', () => hideModal());
-    modal?.addEventListener('click', (ev) => {
-      if (ev.target === modal) hideModal(); // click fuera de la tarjeta
-    });
-    document.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Escape' && modal && modal.style.display !== 'none') hideModal();
-    });
+    modal?.addEventListener('click', (ev) => { if (ev.target === modal) hideModal(); });
+    document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && modal && modal.style.display !== 'none') hideModal(); });
 
     btnYesSave?.addEventListener('click', async () => {
       hideModal();
@@ -812,14 +1040,29 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       const pid = this.api.partidoId$.value ?? null;
       if (!pid) { alert('No hay partido en curso para guardar.'); return; }
 
-      // deshabilitar botón y feedback
+      // Guardar últimos titulares ANTES de finalizar/guardar
+      await saveCurrentStartersToRoster();
+
       const originalText = btnSaveMatch?.textContent || '';
       if (btnSaveMatch) { btnSaveMatch.disabled = true; btnSaveMatch.textContent = 'Guardando…'; }
 
       try {
-        await this.api.saveMatch(pid);          // ⬅️ debe existir en ApiService
-        await this.api.resetMatch(null);        // limpia visor/estado local SIN borrar BD
-        this.clearSideUI(host);                 // por si acaso, limpiar laterales
+        await this.api.saveMatch(pid);
+        await this.api.resetMatch(null);
+        // limpiar titulares seleccionados
+        this.starters.local.clear(); this.starters.visitante.clear();
+        if (cntLocal) cntLocal.textContent = '0/5';
+        if (cntVisit) cntVisit.textContent = '0/5';
+        this.clearSideUI(host);
+
+        // borrar persistencia de los equipos que acabaron de jugar
+        const t = this.api.teams$.value;
+        this.clearStorageFor('local', t.local?.id ?? null);
+        this.clearStorageFor('visitante', t.visitante?.id ?? null);
+
+        if (msgLocal) msgLocal.textContent = '';
+        if (msgVisit) msgVisit.textContent = '';
+
         showToast('✅ Partido guardado. Listo para iniciar el siguiente.', 5000);
       } catch (err: any) {
         alert(err?.message ?? 'No se pudo guardar el partido.');
@@ -866,7 +1109,7 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
       this.api.ajustarFalta(pid, { equipoId: team.id, jugadorId, delta: -1 }).subscribe();
     });
 
-    /* Render “Fuera por 5” */
+    /* Render "Fuera por 5" */
     const renderOutList = (ul: HTMLElement | null, items: { dorsal?: number; nombre: string; faltas: number }[]) => {
       if (!ul) return;
       if (!items || items.length === 0) {
@@ -959,3 +1202,4 @@ export class ControlComponent implements AfterViewInit, OnDestroy {
     this.subs.forEach(s => s.unsubscribe());
   }
 }
+// Persistencia F5: la selección de titulares se guarda por equipo en localStorage y se restaura al recargar.

@@ -56,6 +56,18 @@ export interface StartPartidoResponse {
   visitante: { id: number; nombre: string; abreviatura?: string; color?: string; };
 }
 
+/* ===== Roster (para guardar titulares) ===== */
+export interface RosterItemPost {
+  partidoId: number;
+  equipoId: number;
+  jugadorId: number;
+  esTitular: boolean;
+}
+export interface SaveRosterRequest {
+  partidoId: number;
+  items: RosterItemPost[];
+}
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   readonly api = environment.apiBase;
@@ -205,6 +217,14 @@ export class ApiService {
     try { const t = await firstValueFrom(this.getTimeoutsResumen(partidoId)); this.timeouts$.next(t); } catch {}
 
     return partidoId;
+  }
+
+  /* ====== ROSTER (ADMIN) ======
+     Usamos el endpoint de administración para persistir titulares del partido creado desde el Panel. */
+  saveRosterAdmin(partidoId: number, items: RosterItemPost[]): Promise<void> {
+    const body: SaveRosterRequest = { partidoId, items };
+    const url = `${this.api}/api/admin/partidos/${partidoId}/roster`;
+    return firstValueFrom(this.http.put<void>(url, body));
   }
 
   clearPartidoLocalState() {
