@@ -6,9 +6,17 @@ import { TokenStorage } from './token-storage.service';
 @Injectable()
 export class AuthInterceptor implements HttpInterceptor {
   constructor(private store: TokenStorage) {}
+
   intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
     const token = this.store.accessToken;
-    if (!token) return next.handle(req);
-    return next.handle(req.clone({ setHeaders: { Authorization: `Bearer ${token}` } }));
+    const isLogin = req.url.includes('/api/auth/login');
+
+    if (!token || isLogin) {
+      return next.handle(req);
+    }
+
+    return next.handle(req.clone({
+      setHeaders: { Authorization: `Bearer ${token}` }
+    }));
   }
 }
