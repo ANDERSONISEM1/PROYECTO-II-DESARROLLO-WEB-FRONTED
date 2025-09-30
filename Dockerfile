@@ -9,6 +9,9 @@ COPY package*.json ./
 COPY angular.json ./
 COPY tsconfig*.json ./
 
+# (Opcional) toolchain si compilas binarios nativos
+# RUN apk add --no-cache python3 make g++
+
 # Instala dependencias de forma reproducible
 RUN npm ci
 
@@ -24,17 +27,17 @@ FROM nginx:alpine
 # Instalar curl para healthcheck
 RUN apk add --no-cache curl
 
-# Limpia el docroot y copia el build (Angular v17+ suele quedar en dist/<app>/browser)
+# Limpia el docroot y copia el build (tu outputPath = dist/web)
 RUN rm -rf /usr/share/nginx/html/*
-COPY --from=builder /app/dist/web/browser/. /usr/share/nginx/html/
+COPY --from=builder /app/dist/web/. /usr/share/nginx/html/
 
-# Verificación build-time (no rompe si falla el ls)
-RUN echo "=== LISTANDO /usr/share/nginx/html ===" && ls -la /usr/share/nginx/html/ || true
-
-# Nginx config
+# Nginx config (SPA con fallback a index.html)
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
+
+# Verificación build-time (no rompe si falla el ls)
+RUN echo "=== LISTANDO /usr/share/nginx/html ===" && ls -la /usr/share/nginx/html/ || true
 
 # Healthcheck simple al index
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
